@@ -19,6 +19,7 @@ class SMTP extends EmailAdapter
      * @param string $smtpSecure SMTP Secure prefix. Can be '', 'ssl' or 'tls'
      * @param bool $smtpAutoTLS Enable/disable SMTP AutoTLS feature. Defaults to false.
      * @param string $xMailer The value to use for the X-Mailer header.
+     * @param bool $sendInBatch Whether to send emails in batch or individually.
      */
     public function __construct(
         private string $host,
@@ -27,7 +28,8 @@ class SMTP extends EmailAdapter
         private string $password = '',
         private string $smtpSecure = '',
         private bool $smtpAutoTLS = false,
-        private string $xMailer = ''
+        private string $xMailer = '',
+        private bool $sendInBatch = false
     ) {
         if (!\in_array($this->smtpSecure, ['', 'ssl', 'tls'])) {
             throw new \InvalidArgumentException('Invalid SMTP secure prefix. Must be "", "ssl" or "tls"');
@@ -50,6 +52,79 @@ class SMTP extends EmailAdapter
     protected function process(EmailMessage $message): array
     {
         $response = new Response($this->getType());
+
+        if ($this->sendInBatch) {
+            return $this->processBatch($message, $response);
+        }
+
+        return $this->processIndividual($message, $response);
+    }
+
+    /**
+     * Process emails in batch mode
+     */
+    private function processBatch(EmailMessage $message, Response $response): array
+    {
+        $mail = $this->configurePHPMailer();
+        $this->setupEmail($mail, $message);
+
+        foreach ($message->getTo() as $to) {
+            $mail->addAddress($to);
+        }
+
+        $sent = $mail->send();
+
+        if ($sent) {
+            $response->setDeliveredTo(\count($message->getTo()));
+        }
+
+        foreach ($message->getTo() as $to) {
+            $error = empty($mail->ErrorInfo)
+                ? 'Unknown error'
+                : $mail->ErrorInfo;
+
+            $response->addResult($to, $sent ? '' : $error);
+        }
+
+        return $response->toArray();
+    }
+
+    /**
+     * Process emails individually
+     */
+    private function processIndividual(EmailMessage $message, Response $response): array
+    {
+        foreach ($message->getTo() as $to) {
+            $mail = $this->configurePHPMailer();
+            $this->setupEmail($mail, $message);
+
+            $mail->addAddress($to);
+            $sent = $mail->send();
+
+            if ($sent) {
+                $response->setDeliveredTo(1);
+                $response->addResult($to);
+            } else {
+                $error = empty($mail->ErrorInfo)
+                    ? 'Unknown error'
+                    : $mail->ErrorInfo;
+                $response->addResult($to, $error);
+            }
+
+            // Clear all addresses for the next iteration
+            $mail->clearAddresses();
+            $mail->clearCCs();
+            $mail->clearBCCs();
+        }
+
+        return $response->toArray();
+    }
+
+    /**
+     * Configure PHPMailer with SMTP settings
+     */
+    private function configurePHPMailer(): PHPMailer
+    {
         $mail = new PHPMailer();
         $mail->isSMTP();
         $mail->XMailer = $this->xMailer;
@@ -61,6 +136,15 @@ class SMTP extends EmailAdapter
         $mail->SMTPSecure = $this->smtpSecure;
         $mail->SMTPAutoTLS = $this->smtpAutoTLS;
         $mail->CharSet = 'UTF-8';
+
+        return $mail;
+    }
+
+    /**
+     * Setup email content and properties
+     */
+    private function setupEmail(PHPMailer $mail, EmailMessage $message): void
+    {
         $mail->Subject = $message->getSubject();
         $mail->Body = $message->getContent();
         $mail->setFrom($message->getFromEmail(), $message->getFromName());
@@ -72,10 +156,15 @@ class SMTP extends EmailAdapter
         $mail->AltBody = \strip_tags($mail->AltBody);
         $mail->AltBody = \trim($mail->AltBody);
 
-        foreach ($message->getTo() as $to) {
-            $mail->addAddress($to);
-        }
+        $this->addCCAndBCC($mail, $message);
+        $this->addAttachments($mail, $message);
+    }
 
+    /**
+     * Add CC and BCC recipients to the email
+     */
+    private function addCCAndBCC(PHPMailer $mail, EmailMessage $message): void
+    {
         if (!empty($message->getCC())) {
             foreach ($message->getCC() as $cc) {
                 $mail->addCC($cc['email'], $cc['name'] ?? '');
@@ -87,7 +176,13 @@ class SMTP extends EmailAdapter
                 $mail->addBCC($bcc['email'], $bcc['name'] ?? '');
             }
         }
+    }
 
+    /**
+     * Add attachments to the email
+     */
+    private function addAttachments(PHPMailer $mail, EmailMessage $message): void
+    {
         if (!empty($message->getAttachments())) {
             $size = 0;
 
@@ -107,21 +202,5 @@ class SMTP extends EmailAdapter
                 );
             }
         }
-
-        $sent = $mail->send();
-
-        if ($sent) {
-            $response->setDeliveredTo(\count($message->getTo()));
-        }
-
-        foreach ($message->getTo() as $to) {
-            $error = empty($mail->ErrorInfo)
-                ? 'Unknown error'
-                : $mail->ErrorInfo;
-
-            $response->addResult($to, $sent ? '' : $error);
-        }
-
-        return $response->toArray();
     }
 }

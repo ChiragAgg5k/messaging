@@ -12,10 +12,13 @@ class Sendgrid extends EmailAdapter
 
     /**
      * @param  string  $apiKey Your Sendgrid API key to authenticate with the API.
+     * @param  bool  $sendInBatch Whether to send emails in batch or individually
      * @return void
      */
-    public function __construct(private string $apiKey)
-    {
+    public function __construct(
+        private string $apiKey,
+        private bool $sendInBatch = false
+    ) {
     }
 
     /**
@@ -39,6 +42,20 @@ class Sendgrid extends EmailAdapter
      */
     protected function process(EmailMessage $message): array
     {
+        $response = new Response($this->getType());
+
+        if ($this->sendInBatch) {
+            return $this->processBatch($message, $response);
+        }
+
+        return $this->processIndividual($message, $response);
+    }
+
+    /**
+     * Process emails in batch mode
+     */
+    private function processBatch(EmailMessage $message, Response $response): array
+    {
         $personalizations = [
             [
                 'to' => \array_map(
@@ -49,15 +66,63 @@ class Sendgrid extends EmailAdapter
             ],
         ];
 
+        $this->addCCAndBCC($message, $personalizations[0]);
+        $attachments = $this->prepareAttachments($message);
+
+        $body = $this->prepareRequestBody($message, $personalizations, $attachments);
+        $result = $this->sendRequest($body);
+
+        $this->handleResponse($result, $message, $response);
+
+        return $response->toArray();
+    }
+
+    /**
+     * Process emails individually
+     */
+    private function processIndividual(EmailMessage $message, Response $response): array
+    {
+        $attachments = $this->prepareAttachments($message);
+
+        foreach ($message->getTo() as $recipient) {
+            $personalizations = [
+                [
+                    'to' => [['email' => $recipient]],
+                    'subject' => $message->getSubject(),
+                ],
+            ];
+
+            $this->addCCAndBCC($message, $personalizations[0]);
+
+            $body = $this->prepareRequestBody($message, $personalizations, $attachments);
+            $result = $this->sendRequest($body);
+
+            if ($result['statusCode'] === 202) {
+                $response->setDeliveredTo(1);
+                $response->addResult($recipient);
+            } else {
+                $errorMessage = $this->getErrorMessage($result);
+                $response->addResult($recipient, $errorMessage);
+            }
+        }
+
+        return $response->toArray();
+    }
+
+    /**
+     * Add CC and BCC recipients to personalizations
+     */
+    private function addCCAndBCC(EmailMessage $message, array &$personalization): void
+    {
         if (!\is_null($message->getCC())) {
             foreach ($message->getCC() as $cc) {
                 if (!empty($cc['name'])) {
-                    $personalizations[0]['cc'][] = [
+                    $personalization['cc'][] = [
                         'name' => $cc['name'],
                         'email' => $cc['email'],
                     ];
                 } else {
-                    $personalizations[0]['cc'][] = [
+                    $personalization['cc'][] = [
                         'email' => $cc['email'],
                     ];
                 }
@@ -67,18 +132,24 @@ class Sendgrid extends EmailAdapter
         if (!\is_null($message->getBCC())) {
             foreach ($message->getBCC() as $bcc) {
                 if (!empty($bcc['name'])) {
-                    $personalizations[0]['bcc'][] = [
+                    $personalization['bcc'][] = [
                         'name' => $bcc['name'],
                         'email' => $bcc['email'],
                     ];
                 } else {
-                    $personalizations[0]['bcc'][] = [
+                    $personalization['bcc'][] = [
                         'email' => $bcc['email'],
                     ];
                 }
             }
         }
+    }
 
+    /**
+     * Prepare attachments for the request
+     */
+    private function prepareAttachments(EmailMessage $message): array
+    {
         $attachments = [];
 
         if (!\is_null($message->getAttachments())) {
@@ -102,6 +173,14 @@ class Sendgrid extends EmailAdapter
             }
         }
 
+        return $attachments;
+    }
+
+    /**
+     * Prepare the request body
+     */
+    private function prepareRequestBody(EmailMessage $message, array $personalizations, array $attachments): array
+    {
         $body = [
             'personalizations' => $personalizations,
             'reply_to' => [
@@ -124,8 +203,15 @@ class Sendgrid extends EmailAdapter
             $body['attachments'] = $attachments;
         }
 
-        $response = new Response($this->getType());
-        $result = $this->request(
+        return $body;
+    }
+
+    /**
+     * Send the request to Sendgrid API
+     */
+    private function sendRequest(array $body): array
+    {
+        return $this->request(
             method: 'POST',
             url: 'https://api.sendgrid.com/v3/mail/send',
             headers: [
@@ -134,26 +220,39 @@ class Sendgrid extends EmailAdapter
             ],
             body: $body,
         );
+    }
 
-        $statusCode = $result['statusCode'];
-
-        if ($statusCode === 202) {
+    /**
+     * Handle the API response
+     */
+    private function handleResponse(array $result, EmailMessage $message, Response $response): void
+    {
+        if ($result['statusCode'] === 202) {
             $response->setDeliveredTo(\count($message->getTo()));
             foreach ($message->getTo() as $to) {
                 $response->addResult($to);
             }
         } else {
             foreach ($message->getTo() as $to) {
-                if (\is_string($result['response'])) {
-                    $response->addResult($to, $result['response']);
-                } elseif (!\is_null($result['response']['errors'][0]['message'] ?? null)) {
-                    $response->addResult($to, $result['response']['errors'][0]['message']);
-                } else {
-                    $response->addResult($to, 'Unknown error');
-                }
+                $errorMessage = $this->getErrorMessage($result);
+                $response->addResult($to, $errorMessage);
             }
         }
+    }
 
-        return $response->toArray();
+    /**
+     * Get error message from API response
+     */
+    private function getErrorMessage(array $result): string
+    {
+        if (\is_string($result['response'])) {
+            return $result['response'];
+        }
+
+        if (!\is_null($result['response']['errors'][0]['message'] ?? null)) {
+            return $result['response']['errors'][0]['message'];
+        }
+
+        return 'Unknown error';
     }
 }
